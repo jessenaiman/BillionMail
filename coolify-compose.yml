@@ -1,0 +1,252 @@
+name: billionmail
+
+services:
+    pgsql-billionmail:
+      image: postgres:17.4-alpine
+      hostname: pgsql
+      volumes:
+        - ./postgresql-data:/var/lib/postgresql/data
+        - ./postgresql-socket:/var/run/postgresql
+      environment:
+        - TZ=${TZ}
+        - POSTGRES_DB=${DBNAME}
+        - POSTGRES_USER=${DBUSER}
+        - POSTGRES_PASSWORD=${DBPASS}
+      restart: always
+      # Removed ports for Coolify
+      networks:
+        billionmail-network:
+          aliases:
+            - pgsql
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -h localhost -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+        interval: 5s
+        timeout: 5s
+        retries: 10
+        start_period: 20s
+
+    redis-billionmail:
+      image: redis:7.4.2-alpine
+      hostname: redis
+      entrypoint: ["/bin/sh","/redis-conf.sh"]
+      volumes:
+        - ./redis-data:/data
+        - ./conf/redis/redis-conf.sh:/redis-conf.sh
+      restart: always
+      # Removed ports for Coolify
+      environment:
+        - TZ=${TZ}
+        - REDISPASS=${REDISPASS}
+      sysctls:
+        - net.core.somaxconn=4096
+      networks:
+        billionmail-network:
+          aliases:
+            - redis
+      healthcheck:
+        test: ["CMD-SHELL", "redis-cli -h localhost -p 6379 ping"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+
+    rspamd-billionmail:
+      image: billionmail/rspamd:1.1
+      hostname: rspamd
+      depends_on:
+        - redis-billionmail
+      environment:
+        - TZ=${TZ}
+        - REDISPASS=${REDISPASS}
+      volumes:
+        - ./conf/rspamd/local.d:/etc/rspamd/local.d
+        - ./conf/rspamd/statistic.conf:/etc/rspamd/statistic.conf
+        - ./conf/rspamd/rspamd.conf:/etc/rspamd/rspamd.conf 
+        - ./rspamd-data:/var/lib/rspamd
+        - ./logs/rspamd:/var/log/rspamd
+      restart: always
+      networks:
+        billionmail-network:
+          aliases:
+            - rspamd
+      # Suggestion: Add a healthcheck for rspamd. Example:
+      healthcheck:
+        test: ["CMD-SHELL", "rspamc stat || exit 1"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+      # Please review rspamd healthcheck command in documentation.
+
+    dovecot-billionmail:
+      image: billionmail/dovecot:1.3
+      hostname: dovecot
+      depends_on:
+        - pgsql-billionmail
+        - redis-billionmail
+      cap_add:
+        - NET_BIND_SERVICE
+      volumes:
+        - ./conf/dovecot/conf.d:/etc/dovecot/conf.d
+        - ./conf/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf
+        - ./conf/dovecot/rsyslog.conf:/etc/rsyslog.conf
+        - ./logs/dovecot:/var/log/mail
+        - ./ssl:/etc/ssl/mail
+        - ./ssl-self-signed:/etc/ssl/ssl-self-signed
+        - ./vmail-data:/var/vmail
+        - ./rspamd-data:/var/lib/rspamd
+        - ./postgresql-socket:/var/run/postgresql
+      environment:
+        - DBNAME=${DBNAME}
+        - DBUSER=${DBUSER}
+        - DBPASS=${DBPASS}
+        - TZ=${TZ}
+        - BILLIONMAIL_HOSTNAME=${BILLIONMAIL_HOSTNAME}
+        - REDISPASS=${REDISPASS}
+      # Removed ports for Coolify
+      restart: always
+      ulimits:
+        nproc: 65535
+        nofile:
+          soft: 20000
+          hard: 40000
+      networks:
+        billionmail-network:
+          aliases:
+            - dovecot
+      # Suggestion: Add a healthcheck for dovecot. Example:
+      healthcheck:
+        test: ["CMD-SHELL", "doveadm ping || exit 1"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+      # Please review dovecot healthcheck command in documentation.
+
+    postfix-billionmail:
+      image: billionmail/postfix:1.3
+      hostname: postfix
+      depends_on:
+        pgsql-billionmail:
+          condition: service_started
+      volumes:
+        - ./conf/postfix/main.cf:/etc/postfix/main.cf
+        - ./conf/postfix/master.cf:/etc/postfix/master.cf
+        - ./conf/postfix/conf:/etc/postfix/conf
+        - ./conf/postfix/sql:/etc/postfix/sql
+        - ./conf/postfix/rsyslog.conf:/etc/rsyslog.conf
+        - ./logs/postfix:/var/log/mail
+        - ./ssl:/etc/ssl/mail
+        - ./postfix-data:/var/spool/postfix
+        - ./rspamd-data:/var/lib/rspamd
+        - ./postgresql-socket:/var/run/postgresql
+      environment:
+        - TZ=${TZ}
+        - DBNAME=${DBNAME}
+        - DBUSER=${DBUSER}
+        - DBPASS=${DBPASS}
+        - REDISPASS=${REDISPASS}
+        - BILLIONMAIL_HOSTNAME=${BILLIONMAIL_HOSTNAME}
+      cap_add:
+        - NET_BIND_SERVICE
+      # Removed ports for Coolify
+      restart: always
+      networks:
+        billionmail-network:
+          aliases:
+            - postfix
+      # Suggestion: Add a healthcheck for postfix. Example:
+      healthcheck:
+        test: ["CMD-SHELL", "postfix status || exit 1"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+      # Please review postfix healthcheck command in documentation.
+
+    webmail-billionmail:
+      image: roundcube/roundcubemail:1.6.10-fpm-alpine
+      hostname: roundcube
+      depends_on:
+        - pgsql-billionmail
+        - dovecot-billionmail
+        - postfix-billionmail
+      volumes:
+        - ./webmail-data:/var/www/html
+        - ./conf/webmail/mime.types:/var/roundcube/config/mime.types
+        - ./conf/webmail:/var/roundcube/config
+        - ./conf/php:/usr/local/etc
+        - ./php-sock/:/var/run/
+      environment:
+        - TZ=${TZ}
+        - ROUNDCUBEMAIL_DB_TYPE=pgsql
+        - ROUNDCUBEMAIL_DB_HOST=pgsql
+        - ROUNDCUBEMAIL_DB_NAME=${DBNAME}
+        - ROUNDCUBEMAIL_DB_USER=${DBUSER}
+        - ROUNDCUBEMAIL_DB_PASSWORD=${DBPASS}
+        - ROUNDCUBEMAIL_DEFAULT_HOST=dovecot
+        - ROUNDCUBEMAIL_DEFAULT_PORT=${IMAP_PORT:-143}
+        - ROUNDCUBEMAIL_SMTP_SERVER=postfix
+        - ROUNDCUBEMAIL_SMTP_PORT=${SMTP_PORT:-25}
+        - ROUNDCUBEMAIL_REQUEST_PATH=/roundcube
+      restart: always
+      networks:
+        billionmail-network:
+          aliases:
+            - webmail
+      # Suggestion: Add a healthcheck for roundcube. Example:
+      healthcheck:
+        test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000 || exit 1"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+      # Please review roundcube healthcheck command in documentation and adjust port if needed.
+
+    core-billionmail:
+      image: billionmail/core:2.3
+      hostname: core-manage
+      depends_on:
+        - pgsql-billionmail
+      volumes:
+        - ./ssl:/etc/ssl/mail
+        - ./ssl-self-signed:/etc/ssl/ssl-self-signed
+        - ./conf/core/fail2ban/filter.d:/etc/fail2ban/filter.d
+        - ./conf/core/fail2ban/jail.d:/etc/fail2ban/jail.d
+        - ./logs/fail2ban:/var/log/fail2ban
+        - ./postgresql-socket:/opt/billionmail/postgresql-socket
+        - ./php-sock:/opt/billionmail/php-sock
+        - ./rspamd-data:/opt/billionmail/rspamd-data
+        - ./webmail-data:/opt/billionmail/webmail-data
+        - ./.env:/opt/billionmail/.env
+        - ./conf:/opt/billionmail/conf
+        - ./logs:/opt/billionmail/logs
+        - ./logs/core:/opt/billionmail/core/logs
+        - ./core-data:/opt/billionmail/core/data
+        - /var/run/docker.sock:/var/run/docker.sock:ro
+      environment:
+        - TZ=${TZ}
+        - FAIL2BAN_INIT=${FAIL2BAN_INIT:-y}
+      cap_add:
+        - NET_BIND_SERVICE
+        - NET_ADMIN
+        - NET_RAW
+      # Removed ports for Coolify
+      restart: always
+      networks:
+        billionmail-network:
+          aliases:
+            - core
+      # Suggestion: Add a healthcheck for core. Example:
+      healthcheck:
+        test: ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"]
+        interval: 5s
+        timeout: 5s
+        retries: 3
+      # Please review core healthcheck command in documentation and adjust port/path if needed.
+
+networks:
+  billionmail-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-billionmail
+    ipam:
+      driver: default
+      config:
+        - subnet: ${IPV4_NETWORK:-172.66.1}.0/24
+
